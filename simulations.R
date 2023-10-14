@@ -7,82 +7,80 @@ library(marcher)
 library(rjags)
 library(Rcpp)
 
-sourceCpp("C:/Users/pthom/Documents/School/THESIS/Ch4_5_migration/code/Github/cpp_functions.cpp")
-source("C:/Users/pthom/Documents/School/THESIS/Ch4_5_migration/code/Github/fitting_functions.R")
+source("fitting_functions.R")
+sourceCpp("cpp_functions.cpp")
+# functions from waddle package
+waddle_dir = "" # replace with where the waddle library is located in your device 
+lapply(list.files(waddle_dir), function(f) {
+  source(paste0(waddle_dir, "/R/", f))
+})
 
-N_SIM = 55 # How many random migrations to simulate? In reality we want 50; this is coverage for the occasional failed convergence from the NSD model.
+set.seed(111) # for consistency
 
-# True values for all model parameters
-t1_MIG = 70
-t2_MIG = 100
+N_SIM = 50 # How many random migrations to simulate? In reality we want 50; this is coverage for the occasional failed convergence from the NSD model.
 
-N_DAYS = 200
-N_STEPS_DESIRED = 150
-GPS_ERROR = 0.5
+N_STEPS = 300 # number of timesteps
+T1 = 100 # beginning of migration(s)
+T2 = 200 # end of migration(s)
+PERCENT_REMOVED = 1/12 # gives us about 250 steps
+ERROR = 0 # gps error; let's start by assuming it's negligible and move from there
 
-RHO_0 = 5
-RHO_1 = 40
-KAPPA_0 = 0
-KAPPA_1 = 0.5
+# Which model are we simulating from? Pick the simulation function here and simulate from one of the 3 processes from Gurarie et al 2016
+sim_model = "speed"
 
-BUFFER = 7
-FPT_RADII = seq(5, 100, 5)
+all_results = data.frame()
+
+# TO DO: 1) Is FPT working the way it's supposed to? Test one of the bias fits (in Gurarie et al 2016 it did great with those; maybe they do it differently than I did or maybe mine has a bug?)
 
 for (i in 1:N_SIM) {
-  # Simulate random data
-  data_for_migration = sim_migratory_movement(N_DAYS, t1_MIG, t2_MIG, percent_removed = (1 - N_STEPS_DESIRED / N_DAYS) / 2, sl_migration = RHO_0 + RHO_1, sl_resident = RHO_0, kappa_migration = KAPPA_1, kappa_resident = KAPPA_0, error = GPS_ERROR, return_code2_only = FALSE)
   
-  data_code2only = data_for_migration[data_for_migration$Code == 2, -8] %>% as.matrix # for our model
+  # simulate the path; depends on what model we choose. Speciic parameters taken roughly from Gurarie et al 2016
+  if (sim_model == "speed") {
+    data_for_migration = sim_migration_cvm(n_timesteps = N_STEPS, migration_starts = T1, migration_ends = T2, percent_removed = PERCENT_REMOVED, error = ERROR, nu_resident = 1, nu_migration = 5, tau_resident = 2, tau_migration = 2, return_code2_only = FALSE)
+  } else if (sim_model == "timescale") {
+    data_for_migration = sim_migration_cvm(n_timesteps = N_STEPS, migration_starts = T1, migration_ends = T2, percent_removed = PERCENT_REMOVED, error = ERROR, nu_resident = 1, nu_migration = 1, tau_resident = 2, tau_migration = 20, return_code2_only = FALSE)
+  } else { # if (sim_model == "bias")
+    data_for_migration = sim_migration_bcrw(n_timesteps = N_STEPS, migration_starts = T1, migration_ends = T2, migration_distances = 50, percent_removed = PERCENT_REMOVED, error = ERROR, sl_migration = 1, att_migration = 0.9, att_resident = 0.5, return_code2_only = FALSE)
+  }
   
-  # Fit our model
-  times_matrix = make_times_matrix(c(seq(min(data_code2only[, 7]), max(data_code2only[, 7]), by = 14), max(data_code2only[,7])), n_migrations = 1, min_diff = BUFFER)
+  t0 = Sys.time()
   
-  message("Starting model fit for simulation ", i)
-  
+  # Our model
+  data_code2only = data_for_migration %>% dplyr::filter(Code == 2) %>% dplyr::select(-Code) %>% as.matrix
+  times_matrix = make_times_matrix(c(seq(min(data_code2only[, 7]), max(data_code2only[, 7]), by = 14), max(data_code2only[,7])), n_migrations = 1, min_diff = 7)
+  model_fit_mmcp = estimate_times_nlevels(times_matrix, c(14, 7, 3, 1), data_code2only, 
+                                          mod_type = "r1k1", NLL_include = 5, cpp = TRUE, min_diff = 7,
+                                          bounds = c(min(data_code2only[, 7]), max(data_code2only[, 7])))
+  model_fit_mmcp = model_fit_mmcp[which.min(model_fit_mmcp[,3]), , drop = FALSE]
   t1 = Sys.time()
   
-  model_fit_thompson = estimate_times_nlevels(times_matrix, c(14, 7, 3, 1), data_code2only, mod_type = "r1k1", NLL_include = 5, cpp = TRUE, bounds = c(min(data_code2only[, 7]), max(data_code2only[, 7])), min_diff = BUFFER)
-  model_fit_thompson = model_fit_thompson[which.min(model_fit_thompson[,3]), , drop = FALSE]
-  print("Done")
-  
+  # NSD (nonlinear least squares) model
+  model_fit_nsd = fit_NSD_migration(data_for_migration[, c(1,2,7)], units = "km")
   t2 = Sys.time()
   
-  # Fit the NSD model from Bunnefeld et al (2011)
-  model_fit_bunnefeld = tryCatch(fit_NSD_migration(data_for_migration[, c(1,2,7)], units = "km"), error = function(e) {
-    return(c(delta = NA, theta = NA, phi = NA, t1.theta = NA, t2.theta = NA))
-  })
-  
+  # FPT (penalized contrast) model
+  model_fit_fpt = fit_fpt_penalized_contrast(data_for_migration[, c(1,2,7)], seq(5, 100, 5))
   t3 = Sys.time()
   
-  # Fit the FPT model from Le Corre et al. (2014)
-  model_fit_lecorre = fit_fpt_penalized_contrast(data_for_migration[, c(1,2,7)], FPT_RADII)
-  
+  # Piecewise regression (Bayesian) model
+  model_fit_pwr = fit_NSD_piecewise(data_for_migration)
   t4 = Sys.time()
   
-  # Fit the PELT model using daily distances from Madon & Hingrat (2014)
-  model_fit_madon = fit_dailydist_pelt(data_for_migration)
-  
+  # Mechanistic range shift analysis
+  model_fit_mrsa = fit_marcher(data_for_migration)
   t5 = Sys.time()
   
-  # Fit the Bayesian piecewise regression model from Wolfson et al. (2022)
-  model_fit_wolfson = fit_NSD_piecewise(data_for_migration)
-  
+  # Behavioral change point analysis
+  model_fit_bcpa = fit_bcpa(data_for_migration[, c(1,2,7)]) %>% sort
   t6 = Sys.time()
   
-  # Fit the marcher model (Gurarie et al., 2017)
-  model_fit_marcher = fit_marcher(data_for_migration)
-  
+  # Bayesian partitioning of Markov models
+  model_fit_bpmm = fit_bpmm(data_for_migration[, c(1, 2, 7)])
   t7 = Sys.time()
   
-  diff_times = data.frame(dt1 = as.numeric(difftime(t2, t1, units = "secs")),
-                          dt2 = as.numeric(difftime(t3, t2, units = "secs")),
-                          dt3 = as.numeric(difftime(t4, t3, units = "secs")),
-                          dt4 = as.numeric(difftime(t5, t4, units = "secs")),
-                          dt5 = as.numeric(difftime(t6, t5, units = "secs")),
-                          dt6 = as.numeric(difftime(t7, t6, units = "secs")))
-  
-  result = cbind(N = i, model_fit_thompson, t(model_fit_bunnefeld), t(model_fit_lecorre), t(model_fit_madon), t(model_fit_wolfson), t(model_fit_marcher), diff_times)
-  all_results = rbind(all_results, result)
+  comp_times = as.numeric(c(t1-t0, t2-t1, t3-t2, t4-t3, t5-t4, t6-t5, t7-t6))
+  this_result = c(model_fit_mmcp, model_fit_nsd, model_fit_fpt, model_fit_pwr, model_fit_mrsa, model_fit_bcpa, model_fit_bpmm, comp_times)
+  all_results = rbind(all_results, this_result)
   
   message("Completed simulation ", i)
 }

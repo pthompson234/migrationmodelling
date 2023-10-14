@@ -100,222 +100,155 @@ sim_migratory_movement = function(n_timesteps,
   
 }
 
-scale_color_gradient = function(values, low, mid, high, midpoint = median(values)) {
-  low_rgb = col2rgb(low)
-  mid_rgb = col2rgb(mid)
-  high_rgb = col2rgb(high)
+# Simulate a migratory movement according to the "speed switch" model from Gurarie et al 2016 and return it in a form that can easily be fit by our models
+#
+# n_timesteps: length of the simulated track (NOTE: if percent_removed > 0, this is NOT necessarily the number of total data points!)
+# migration_starts: vector of start times for the switch to migratory behavior
+# migration_ends: vector of end times for migratory behavior (will switch back to sedentary behavior)
+# percent_removed: number between 0 and 1; how many of the timesteps should we randomly remove (simulates missing data)
+# nu_migration: mean movement speed during migration
+# nu_resident: mean movement speed during "sedentary" movement
+# tau_migration: mean tortuosity during migration
+# tau_resident: mean tortuosity outside of migration
+# error: how much random jitter to add to the points? Simulates independent Gaussian random variables with variance "error" for x and y coordinates of all reported results
+# return_code2_only: do we only return code 2's (see function body for description) or return all non-missing data points
+#
+# Returns a data.frame ready to be passed to the fit_migration_TMB function (see documentation for that function)
+sim_migration_cvm = function(n_timesteps, 
+                             migration_starts, 
+                             migration_ends, 
+                             percent_removed = 0,
+                             nu_migration = 5, 
+                             nu_resident = 1,
+                             tau_migration = 10,
+                             tau_resident = 0,
+                             error = 0,
+                             return_code2_only = TRUE) {
   
-  low_val = min(values)
-  high_val = max(values)
+  # REMINDER: Guide for codes
+  # -2: "missing" point that is included in data frame temporarily
+  # -1: "available" point simulated for use-available modelling
+  # 0: endpoint of a step with no begin point
+  # 1: endpoint of a step with only one previous consecutive point
+  # 2: endpoint of a "full" step with two consecutive previous points
+  # 3: first point of the dataset
+  # 4: endpoint of step beginning at the first point of the dataset
   
-  weights_mid = weights_high = weights_low = numeric(length(values))
-  weights_mid[values < midpoint] = (values[values < midpoint] - low_val) / (midpoint - low_val)
-  weights_mid[values >= midpoint] = (high_val - values[values >= midpoint]) / (high_val - midpoint)
-  weights_low[values < midpoint] = 1 - weights_mid[values < midpoint]
-  weights_high[values >= midpoint] = 1 - weights_mid[values >= midpoint]
+  n_migrations = length(migration_starts)
+  nu_values = c(rep(c(nu_resident, nu_migration), n_migrations), nu_resident)
+  tau_values = c(rep(c(tau_resident, tau_migration), n_migrations), tau_resident)
+  all_times_sorted = c(0, migration_starts, migration_ends, n_timesteps)
+  all_times_sorted = all_times_sorted[order(all_times_sorted)]
+  tcp_values = diff(all_times_sorted) + 1 # add 1 because the CVM function returns an object of length tcp_values[i] - 1
+  tcp_values[1] = tcp_values[1] + 2 # the resulting # of pts in the data.frame will be n_timesteps + 2 because we need 3 consecutive locations to calculate turning angles
   
-  new_reds = weights_low * low_rgb[1] + weights_mid * mid_rgb[1] + weights_high * high_rgb[1]
-  new_greens = weights_low * low_rgb[2] + weights_mid * mid_rgb[2] + weights_high * high_rgb[2]
-  new_blues = weights_low * low_rgb[3] + weights_mid * mid_rgb[3] + weights_high * high_rgb[3]
+  path_raw = multiCVM(taus = tau_values, nus = nu_values, Ts = tcp_values)
   
-  rgb(new_reds, new_greens, new_blues, maxColorValue = 255)
+  all_df = data.frame(t = seq(-1, n_timesteps), x = Re(path_raw$Z), y = Im(path_raw$Z))
+  
+  # Including artificial error
+  if (error > 0) {
+    all_df$x = all_df$x + rnorm(nrow(all_df), 0, error)
+    all_df$y = all_df$y + rnorm(nrow(all_df), 0, error)
+  }
+  
+  # Remove locations randomly (we just set the code to -2)
+  all_df$Code = c(3, ifelse(runif(n_timesteps + 1) < percent_removed, -2, 2))
+  # locations with a missing point before them get code 0
+  all_df = all_df %>% mutate(Code = ifelse(dplyr::lag(Code) == -2 & Code != -2, 0, Code)) 
+  # the first location will become NA throughout this process so we fix them after. We need to do this twice otherwise the second location will become NA and we will lose the code, and this will interfere with our ability to classify the 3rd and 4th locations
+  all_df$Code[1] = 3
+  # locations that aren't missing with a 0 before them get a 1
+  all_df = all_df %>% mutate(Code = ifelse(dplyr::lag(Code) == 0 & Code != -2, 1, Code))
+  # the first location will become NA throughout this process so we fix them after
+  all_df$Code[1] = 3
+  if (all_df$Code[2] == 2) all_df$Code[2] = 4 # change this because it isn't a 2
+  
+  all_df = all_df %>% mutate(x1 = dplyr::lag(x), y1 = dplyr::lag(y)) %>% 
+    mutate(x2 = dplyr::lag(x1), y2 = dplyr::lag(y1))
+  
+  if (!return_code2_only) return(all_df[all_df$Code >= 0, c("x", "y", "x1", "y1", "x2", "y2", "t", "Code")])
+  all_df[all_df$Code == 2, c("x", "y", "x1", "y1", "x2", "y2", "t")]
   
 }
 
-# Fit the one-migration model (with tanh) using TMB
+# Simulate a migratory movement according to the "bias switch" model from Gurarie et al 2016 and return it in a form that can easily be fit by our models
 #
-# data_in: matrix with fields [longitude/x, latitude/y, x(t-1), y(t-1), x(t-2), y(t-2), difftime/# of days from start]
-# alpha: steepness parameter for tanh functions (fixed)
-# starts: matrix of initial parameter guesses (each column is a parameter) typically made by make_multistart_pars
-# server: are we running this on the server or the local device
-# return_LL: do we return LL_1r to the global environment
-fit_1migration_r_TMB = function(data_in, starts, alpha, server = FALSE, return_LL = FALSE) {
+# n_timesteps: length of the simulated track (NOTE: if percent_removed > 0, this is NOT necessarily the number of total data points!)
+# migration_starts: vector of start times for the switch to migratory behavior
+# migration_ends: vector of end times for migratory behavior (will switch back to sedentary behavior)
+# migration_distances: vector how far each migration goes for
+# percent_removed: number between 0 and 1; how many of the timesteps should we randomly remove (simulates missing data)
+# sl_migration: mean movement speed during migration
+# att_migration: bias term during migration
+# att_resident: bias term during "sedentary" movement
+# rho_migration: angular concentration during migration
+# rho_resident: angular concentration outside of migration
+# error: how much random jitter to add to the points? Simulates independent Gaussian random variables with variance "error" for x and y coordinates of all reported results
+# return_code2_only: do we only return code 2's (see function body for description) or return all non-missing data points
+#
+# Returns a data.frame ready to be passed to the fit_migration_TMB function (see documentation for that function)
+sim_migration_bcrw = function(n_timesteps, 
+                              migration_starts, 
+                              migration_ends, 
+                              migration_distances = migration_ends - migration_starts,
+                              percent_removed = 0,
+                              sl_migration = 1, 
+                              att_migration = 0.9,
+                              att_resident = 0.5,
+                              rho_migration = 0.5,
+                              rho_resident = 0.5,
+                              error = 0,
+                              return_code2_only = TRUE) {
   
-  require(optimx) # multistart
-  require(TMB)
+  # REMINDER: Guide for codes
+  # -2: "missing" point that is included in data frame temporarily
+  # -1: "available" point simulated for use-available modelling
+  # 0: endpoint of a step with no begin point
+  # 1: endpoint of a step with only one previous consecutive point
+  # 2: endpoint of a "full" step with two consecutive previous points
+  # 3: first point of the dataset
+  # 4: endpoint of step beginning at the first point of the dataset
   
-  if (missing(alpha)) alpha = 50 / (max(data_in[,7]) - min(data_in[,7]))
+  n_migrations = length(migration_starts)
+  all_times_sorted = c(0, migration_starts, migration_ends, n_timesteps)
+  all_times_sorted = all_times_sorted[order(all_times_sorted)]
+  tcp_values = diff(all_times_sorted) + 1 # add 1 because the CVM function returns an object of length tcp_values[i] - 1
+  tcp_values[1] = tcp_values[1] + 2 # the resulting # of pts in the data.frame will be n_timesteps + 2 because we need 3 consecutive locations to calculate turning angles
+  zc_values = c(0, rep(cumsum(migration_distances), 2))
+  rho_values = c(rep(c(rho_resident, rho_migration), n_migrations), rho_resident)
+  att_values = c(rep(c(att_resident, att_migration), n_migrations), att_resident)
   
-  Y_prev = data_in[,c(3,4)] - data_in[,c(5,6)]
-  Y_prev_dists = sqrt(rowSums(Y_prev^2))
-  avg_speed = mean(Y_prev_dists)
-  max_speed = max(Y_prev_dists)
+  path_raw = multiBCRW(rhos = rho_values, attractions = att_values, Z.centers = zc_values, ns = tcp_values, a = 1, b = sl_migration)
   
-  Y_prev_normalized = Y_prev / Y_prev_dists
-  Y_prev_normalized[Y_prev_dists == 0, ] = 0
+  # for debugging purposes
+  plot(path_raw)
   
-  if (!server) {
-    # Change working directory temporarily within this function to access c++ files
-    old_wd = getwd()
-    on.exit(setwd(old_wd))
-    setwd("~/School/THESIS/Ch4_5_migration/code")
+  all_df = data.frame(t = seq(-1, n_timesteps), x = Re(path_raw$Z), y = Im(path_raw$Z))
+  
+  # Including artificial error
+  if (error > 0) {
+    all_df$x = all_df$x + rnorm(nrow(all_df), 0, error)
+    all_df$y = all_df$y + rnorm(nrow(all_df), 0, error)
   }
   
-  filename = "1stepmigration_r_20220613"
-  compile(paste0(filename, ".cpp"))
+  # Remove locations randomly (we just set the code to -2)
+  all_df$Code = c(3, ifelse(runif(n_timesteps + 1) < percent_removed, -2, 2))
+  # locations with a missing point before them get code 0
+  all_df = all_df %>% mutate(Code = ifelse(dplyr::lag(Code) == -2 & Code != -2, 0, Code)) 
+  # the first location will become NA throughout this process so we fix them after. We need to do this twice otherwise the second location will become NA and we will lose the code, and this will interfere with our ability to classify the 3rd and 4th locations
+  all_df$Code[1] = 3
+  # locations that aren't missing with a 0 before them get a 1
+  all_df = all_df %>% mutate(Code = ifelse(dplyr::lag(Code) == 0 & Code != -2, 1, Code))
+  # the first location will become NA throughout this process so we fix them after
+  all_df$Code[1] = 3
+  if (all_df$Code[2] == 2) all_df$Code[2] = 4 # change this because it isn't a 2
   
-  data_model = list(xy_curr = data_in[, 1:2], xy_prev = data_in[, 3:4], xy_prevdir = Y_prev_normalized, time_indices = data_in[, 7], T_MIN = min(data_in[, 7]), T_MAX = max(data_in[, 7]), alpha_tanh = alpha)
-  pars_model = list(sigma = 1, r1 = 1, t1 = (data_model$T_MIN + data_model$T_MAX) / 2, delta1 = 0.5) # these values actually don't matter
-  dyn.load(dynlib(filename))
+  all_df = all_df %>% mutate(x1 = dplyr::lag(x), y1 = dplyr::lag(y)) %>% 
+    mutate(x2 = dplyr::lag(x1), y2 = dplyr::lag(y1))
   
-  LL_1r = MakeADFun(data = data_model, parameters = pars_model, DLL = filename)
-  
-  model_fit = multistart(starts, LL_1r$fn, LL_1r$gr, method = "L-BFGS-B", lower = c(0, 0, data_model$T_MIN, 0), upper = c(max_speed, max_speed, data_model$T_MAX, 1), control = list(factr = 1e3, maxit = 1000))
-  
-  best_fit = model_fit[which.min(model_fit$value), ] # get index of best fit
-  best_pars = as.numeric(best_fit[1:4])
-  ses = sdreport(LL_1r)$sd
-  
-  if (return_LL) LL_1r <<- LL_1r
-  
-  data.frame(model = "1r", parname = names(pars_model), NLL = best_fit$value, AIC = 2*best_fit$value + 2*length(best_pars), BIC = 2*best_fit$value + log(nrow(data_in))*length(best_pars), estimate = best_pars, std_err = ses, CL = best_pars - 1.96*ses, CU = best_pars + 1.96*ses, convergence = best_fit$convergence)
-  
-}
-
-# Fit the two-migration model (with tanh) using TMB
-#
-# data_in: matrix with fields [longitude/x, latitude/y, x(t-1), y(t-1), x(t-2), y(t-2), difftime/# of days from start]
-# alpha: steepness parameter for tanh functions (fixed)
-# starts: matrix of initial parameter guesses (each column is a parameter) typically made by make_multistart_pars
-# server: are we running this on the server or the local device
-# return_LL: do we return LL_2r to the global environment
-fit_2migration_r_TMB = function(data_in, starts, alpha, server = FALSE, return_LL = FALSE) {
-  
-  require(optimx) # multistart
-  require(TMB)
-  
-  if (missing(alpha)) alpha = 50 / (max(data_in[,7]) - min(data_in[,7]))
-  
-  Y_prev = data_in[,c(3,4)] - data_in[,c(5,6)]
-  Y_prev_dists = sqrt(rowSums(Y_prev^2))
-  avg_speed = mean(Y_prev_dists)
-  max_speed = max(Y_prev_dists)
-  
-  Y_prev_normalized = Y_prev / Y_prev_dists
-  Y_prev_normalized[Y_prev_dists == 0, ] = 0
-  
-  if (!server) {
-    # Change working directory temporarily within this function to access c++ files
-    old_wd = getwd()
-    on.exit(setwd(old_wd))
-    setwd("~/School/THESIS/Ch4_5_migration/code")
-  }
-  
-  filename = "2stepmigration_r_20220610"
-  compile(paste0(filename, ".cpp"))
-  
-  data_model = list(xy_curr = data_in[, 1:2], xy_prev = data_in[, 3:4], xy_prevdir = Y_prev_normalized, time_indices = data_in[, 7], T_MIN = min(data_in[, 7]), T_MAX = max(data_in[, 7]), alpha_tanh = alpha)
-  pars_model = list(sigma = 1, r1 = 1, r2 = 1, t1 = (data_model$T_MIN + data_model$T_MAX) / 2, delta1 = 0.5, delta2 = 0.5, delta3 = 0.5) # these values actually don't matter
-  dyn.load(dynlib(filename))
-  
-  LL_2r = MakeADFun(data = data_model, parameters = pars_model, DLL = filename)
-  
-  model_fit = multistart(starts, LL_2r$fn, LL_2r$gr, method = "L-BFGS-B", lower = c(0, 0, 0, data_model$T_MIN, 0, 0, 0), upper = c(max_speed, max_speed, max_speed, data_model$T_MAX, 1, 1, 1), control = list(factr = 1e3, maxit = 1000))
-  
-  best_fit = model_fit[which.min(model_fit$value), ] # get index of best fit
-  best_pars = as.numeric(best_fit[1:7])
-  ses = sdreport(LL_2r)$sd
-  
-  if (return_LL) LL_2r <<- LL_2r
-  
-  data.frame(model = "2r", parname = names(pars_model), NLL = best_fit$value, AIC = 2*best_fit$value + 2*length(best_pars), BIC = 2*best_fit$value + log(nrow(data_in))*length(best_pars), estimate = best_pars, std_err = ses, CL = best_pars - 1.96*ses, CU = best_pars + 1.96*ses, convergence = best_fit$convergence)
-  
-}
-
-# Fit the two-migration model (with tanh) using TMB
-#
-# data_in: matrix with fields [longitude/x, latitude/y, x(t-1), y(t-1), x(t-2), y(t-2), difftime/# of days from start]
-# alpha: steepness parameter for tanh functions (fixed)
-# starts: matrix of initial parameter guesses (each column is a parameter) typically made by make_multistart_pars
-# server: are we running this on the server or the local device
-# return_LL: do we return LL_2r to the global environment
-fit_2migration_rk_TMB = function(data_in, starts, alpha, server = FALSE, return_LL = FALSE) {
-  
-  require(optimx) # multistart
-  require(TMB)
-  
-  if (missing(alpha)) alpha = 50 / (max(data_in[,7]) - min(data_in[,7]))
-  
-  Y_steps = data_in[,c(1,2)] - data_in[,c(3,4)]
-  steplengths = sqrt(rowSums(Y_steps^2))
-  avg_speed = mean(steplengths)
-  max_speed = max(steplengths)
-  Y_prev = data_in[,c(3,4)] - data_in[,c(5,6)]
-  headings = atan2(Y_steps[, 2], Y_steps[, 1])
-  prev_headings = atan2(Y_prev[,2], Y_prev[,1])
-  turn_angles = headings - prev_headings
-  
-  if (!server) {
-    # Change working directory temporarily within this function to access c++ files
-    old_wd = getwd()
-    on.exit(setwd(old_wd))
-    setwd("~/School/THESIS/Ch4_5_migration/code")
-  }
-  
-  filename = "2migration_rk_20220614"
-  compile(paste0(filename, ".cpp"))
-  
-  data_model = list(steplengths = steplengths, turn_angles = turn_angles, time_indices = data_in[, 7], T_MIN = min(data_in[, 7]), T_MAX = max(data_in[, 7]), alpha_tanh = alpha)
-  pars_model = list(r0 = 1, r1 = 1, r2 = 1, t1 = (data_model$T_MIN + data_model$T_MAX) / 2, delta1 = 0.5, delta2 = 0.5, delta3 = 0.5, k1 = 1, k2 = 1) # these values actually don't matter
-  dyn.load(dynlib(filename))
-  
-  LL_2r = MakeADFun(data = data_model, parameters = pars_model, DLL = filename)
-  
-  model_fit = multistart(starts, LL_2r$fn, LL_2r$gr, method = "L-BFGS-B", lower = c(0, 0, 0, data_model$T_MIN, 0, 0, 0, 0, 0), upper = c(max_speed, max_speed, max_speed, data_model$T_MAX, 1, 1, 1, 1e5, 1e5), control = list(factr = 1e3, maxit = 1000))
-  
-  best_fit = model_fit[which.min(model_fit$value), ] # get index of best fit
-  best_pars = as.numeric(best_fit[1:length(pars_model)])
-  ses = sdreport(LL_2r)$sd
-  
-  if (return_LL) LL_2r <<- LL_2r
-  
-  data.frame(model = "2rk", parname = names(pars_model), NLL = best_fit$value, AIC = 2*best_fit$value + 2*length(best_pars), BIC = 2*best_fit$value + log(nrow(data_in))*length(best_pars), estimate = best_pars, std_err = ses, CL = best_pars - 1.96*ses, CU = best_pars + 1.96*ses, convergence = best_fit$convergence)
-  
-}
-
-# Fit the one-migration model (with step function and fixed time) using TMB
-#
-# data_in: matrix with fields [longitude/x, latitude/y, x(t-1), y(t-1), x(t-2), y(t-2), difftime/# of days from start]
-# times: 2-vector (should be ordered) of start times (t1, t2)
-# server: are we running this on the server or the local device
-# return_LL: do we return LL_2r to the global environment
-fit_1stepmigration_rkf_TMB = function(data_in, times, server = FALSE, return_LL = FALSE) {
-  
-  # require(optimx) # don't think I need for now but could come back later
-  require(TMB)
-  
-  Y_steps = data_in[,c(1,2)] - data_in[,c(3,4)]
-  steplengths = sqrt(rowSums(Y_steps^2))
-  avg_speed = mean(steplengths)
-  max_speed = max(steplengths)
-  Y_prev = data_in[,c(3,4)] - data_in[,c(5,6)]
-  headings = atan2(Y_steps[, 2], Y_steps[, 1])
-  prev_headings = atan2(Y_prev[,2], Y_prev[,1])
-  turn_angles = headings - prev_headings
-  
-  if (!server) {
-    # Change working directory temporarily within this function to access c++ files
-    old_wd = getwd()
-    on.exit(setwd(old_wd))
-    setwd("~/School/THESIS/Ch4_5_migration/code")
-  }
-  
-  filename = "1migration_rkf_20220810"
-  compile(paste0(filename, ".cpp"))
-  
-  data_model = list(steplengths = steplengths, turn_angles = turn_angles, time_indices = data_in[, 7], t1 = times[1], t2 = times[2])
-  pars_model = list(r0 = 1, r1 = 1, k0 = 1, k1 = 1) # these values actually don't matter
-  dyn.load(dynlib(filename))
-  
-  LL_1rf = MakeADFun(data = data_model, parameters = pars_model, DLL = filename)
-  
-  model_fit = nlminb(LL_1rf$par, LL_1rf$fn, LL_1rf$gr, lower = rep(0, 4), upper = c(max_speed, max_speed, 1e5, 1e5), control = list(eval.max = 1000, iter.max = 1000))
-  
-  ses = sdreport(LL_1rf)$sd
-  
-  if (return_LL) LL_1rf <<- LL_1rf
-  
-  data.frame(model = "1rf", t1 = times[1], t2 = times[2], parname = names(pars_model), NLL = model_fit$objective, AIC = 2*model_fit$objective + 2*length(model_fit$par), BIC = 2*model_fit$objective + log(nrow(data_in))*length(model_fit$par), estimate = model_fit$par, std_err = ses, CL = model_fit$par - 1.96*ses, CU = model_fit$par + 1.96*ses, convergence = model_fit$message)
+  if (!return_code2_only) return(all_df[all_df$Code >= 0, c("x", "y", "x1", "y1", "x2", "y2", "t", "Code")])
+  all_df[all_df$Code == 2, c("x", "y", "x1", "y1", "x2", "y2", "t")]
   
 }
 
@@ -355,186 +288,6 @@ fit_1stepmigration_rkf_analytical = function(data_in, times) {
   
 }
 
-# Fit the two-migration model (with step function and fixed time) using TMB
-#
-# data_in: matrix with fields [longitude/x, latitude/y, x(t-1), y(t-1), x(t-2), y(t-2), difftime/# of days from start]
-# times: 4-vector (should be ordered) of start times (t1, t2, t3, t4)
-# server: are we running this on the server or the local device
-# return_LL: do we return LL_2r to the global environment
-fit_2stepmigration_rkf_TMB = function(data_in, times, server = FALSE, return_LL = FALSE) {
-  
-  # require(optimx) # don't think I need for now but could come back later
-  require(TMB)
-  
-  Y_steps = data_in[,c(1,2)] - data_in[,c(3,4)]
-  steplengths = sqrt(rowSums(Y_steps^2))
-  avg_speed = mean(steplengths)
-  max_speed = max(steplengths)
-  Y_prev = data_in[,c(3,4)] - data_in[,c(5,6)]
-  headings = atan2(Y_steps[, 2], Y_steps[, 1])
-  prev_headings = atan2(Y_prev[,2], Y_prev[,1])
-  turn_angles = headings - prev_headings
-  
-  if (!server) {
-    # Change working directory temporarily within this function to access c++ files
-    old_wd = getwd()
-    on.exit(setwd(old_wd))
-    setwd("~/School/THESIS/Ch4_5_migration/code")
-  }
-  
-  filename = "2migration_rkf_20220810"
-  compile(paste0(filename, ".cpp"))
-  
-  data_model = list(steplengths = steplengths, turn_angles = turn_angles, time_indices = data_in[, 7], t1 = times[1], t2 = times[2], t3 = times[3], t4 = times[4])
-  pars_model = list(r0 = 1, r1 = 1, r2 = 1, k0 = 1, k1 = 1, k2 = 1) # these values actually don't matter
-  dyn.load(dynlib(filename))
-  
-  LL_2rf = MakeADFun(data = data_model, parameters = pars_model, DLL = filename)
-  
-  model_fit = nlminb(LL_2rf$par, LL_2rf$fn, LL_2rf$gr, lower = rep(0,6), upper = c(max_speed, max_speed, max_speed, 1e5, 1e5, 1e5), control = list(eval.max = 1000, iter.max = 1000))
-  
-  ses = sdreport(LL_2rf)$sd
-  
-  if (return_LL) LL_2rf <<- LL_2rf
-  
-  data.frame(model = "2rf", t1 = times[1], t2 = times[2], t3 = times[3], t4 = times[4], parname = names(pars_model), NLL = model_fit$objective, AIC = 2*model_fit$objective + 2*length(model_fit$par), BIC = 2*model_fit$objective + log(nrow(data_in))*length(model_fit$par), estimate = model_fit$par, std_err = ses, CL = model_fit$par - 1.96*ses, CU = model_fit$par + 1.96*ses, convergence = model_fit$message)
-  
-}
-
-# Fit the two-migration model (with step function and fixed time and only one set of migratory parameters) using TMB
-#
-# data_in: matrix with fields [longitude/x, latitude/y, x(t-1), y(t-1), x(t-2), y(t-2), difftime/# of days from start]
-# times: 4-vector (should be ordered) of start times (t1, t2, t3, t4)
-# server: are we running this on the server or the local device
-# return_LL: do we return LL_2r to the global environment
-fit_2stepmigration_rkf1p_TMB = function(data_in, times, server = FALSE, return_LL = FALSE) {
-  
-  # require(optimx) # don't think I need for now but could come back later
-  require(TMB)
-  
-  Y_steps = data_in[,c(1,2)] - data_in[,c(3,4)]
-  steplengths = sqrt(rowSums(Y_steps^2))
-  avg_speed = mean(steplengths)
-  max_speed = max(steplengths)
-  Y_prev = data_in[,c(3,4)] - data_in[,c(5,6)]
-  headings = atan2(Y_steps[, 2], Y_steps[, 1])
-  prev_headings = atan2(Y_prev[,2], Y_prev[,1])
-  turn_angles = headings - prev_headings
-  
-  if (!server) {
-    # Change working directory temporarily within this function to access c++ files
-    old_wd = getwd()
-    on.exit(setwd(old_wd))
-    setwd("~/School/THESIS/Ch4_5_migration/code")
-  }
-  
-  filename = "2migration_rkf1p_20220822"
-  compile(paste0(filename, ".cpp"))
-  
-  data_model = list(steplengths = steplengths, turn_angles = turn_angles, time_indices = data_in[, 7], t1 = times[1], t2 = times[2], t3 = times[3], t4 = times[4])
-  pars_model = list(r0 = 1, r1 = 1, k0 = 1, k1 = 1) # these values actually don't matter
-  dyn.load(dynlib(filename))
-  
-  LL_2rf1p = MakeADFun(data = data_model, parameters = pars_model, DLL = filename)
-  
-  model_fit = nlminb(LL_2rf1p$par, LL_2rf1p$fn, LL_2rf1p$gr, lower = rep(0,4), upper = c(max_speed, max_speed, 1e5, 1e5), control = list(eval.max = 1000, iter.max = 1000))
-  
-  ses = sdreport(LL_2rf1p)$sd
-  
-  if (return_LL) LL_2rf1p <<- LL_2rf1p
-  
-  data.frame(model = "2rf1p", t1 = times[1], t2 = times[2], t3 = times[3], t4 = times[4], parname = names(pars_model), NLL = model_fit$objective, AIC = 2*model_fit$objective + 2*length(model_fit$par), BIC = 2*model_fit$objective + log(nrow(data_in))*length(model_fit$par), estimate = model_fit$par, std_err = ses, CL = model_fit$par - 1.96*ses, CU = model_fit$par + 1.96*ses, convergence = model_fit$message)
-  
-}
-
-# Fit the two-migration model (with direction only and fixed time) using TMB
-#
-# data_in: matrix with fields [longitude/x, latitude/y, x(t-1), y(t-1), x(t-2), y(t-2), difftime/# of days from start]
-# times: 4-vector (should be ordered) of start times (t1, t2, t3, t4)
-# server: are we running this on the server or the local device
-# return_LL: do we return LL_2r to the global environment
-fit_2stepmigration_kvf_TMB = function(data_in, times, server = FALSE, return_LL = FALSE) {
-  
-  # require(optimx) # don't think I need for now but could come back later
-  require(TMB)
-  
-  Y_steps = data_in[,c(1,2)] - data_in[,c(3,4)]
-  steplengths = sqrt(rowSums(Y_steps^2))
-  avg_speed = mean(steplengths)
-  max_speed = max(steplengths)
-  Y_prev = data_in[,c(3,4)] - data_in[,c(5,6)]
-  headings = atan2(Y_steps[, 2], Y_steps[, 1])
-  
-  if (!server) {
-    # Change working directory temporarily within this function to access c++ files
-    old_wd = getwd()
-    on.exit(setwd(old_wd))
-    setwd("~/School/THESIS/Ch4_5_migration/code")
-  }
-  
-  filename = "2migration_kv_20220907"
-  compile(paste0(filename, ".cpp"))
-  
-  data_model = list(steplengths = steplengths, headings = headings, time_indices = data_in[, 7], t1 = times[1], t2 = times[2], t3 = times[3], t4 = times[4])
-  pars_model = list(r0 = avg_speed, k1 = 1, v1 = 0, v2 = 0) # these values actually don't matter
-  dyn.load(dynlib(filename))
-  
-  LL_2kvf = MakeADFun(data = data_model, parameters = pars_model, DLL = filename)
-  
-  model_fit = nlminb(LL_2kvf$par, LL_2kvf$fn, LL_2kvf$gr, lower = c(0, 0, -10*pi, -10*pi), upper = c(max_speed, 1e2, 10*pi, 10*pi), control = list(eval.max = 1000, iter.max = 1000))
-  
-  ses = sdreport(LL_2kvf)$sd
-  
-  if (return_LL) LL_2kvf <<- LL_2kvf
-  
-  data.frame(model = "2kvf", t1 = times[1], t2 = times[2], t3 = times[3], t4 = times[4], parname = names(pars_model), NLL = model_fit$objective, AIC = 2*model_fit$objective + 2*length(model_fit$par), BIC = 2*model_fit$objective + log(nrow(data_in))*length(model_fit$par), estimate = model_fit$par, std_err = ses, CL = model_fit$par - 1.96*ses, CU = model_fit$par + 1.96*ses, convergence = model_fit$message)
-  
-}
-
-# Fit the two-migration model (with "kx" implementation and fixed time) using TMB
-#
-# data_in: matrix with fields [longitude/x, latitude/y, x(t-1), y(t-1), x(t-2), y(t-2), difftime/# of days from start]
-# times: 4-vector (should be ordered) of start times (t1, t2, t3, t4)
-# server: are we running this on the server or the local device
-# return_LL: do we return LL_2r to the global environment
-fit_2stepmigration_kxf_TMB = function(data_in, times, server = FALSE, return_LL = FALSE) {
-  
-  # require(optimx) # don't think I need for now but could come back later
-  require(TMB)
-  
-  Y_steps = data_in[,c(1,2)] - data_in[,c(3,4)]
-  steplengths = sqrt(rowSums(Y_steps^2))
-  avg_speed = mean(steplengths)
-  max_speed = max(steplengths)
-  Y_prev = data_in[,c(3,4)] - data_in[,c(5,6)]
-  headings = atan2(Y_steps[, 2], Y_steps[, 1])
-  
-  if (!server) {
-    # Change working directory temporarily within this function to access c++ files
-    old_wd = getwd()
-    on.exit(setwd(old_wd))
-    setwd("~/School/THESIS/Ch4_5_migration/code")
-  }
-  
-  filename = "2migration_kx_20220908"
-  compile(paste0(filename, ".cpp"))
-  
-  data_model = list(steplengths = steplengths, headings = headings, time_indices = data_in[, 7], t1 = times[1], t2 = times[2], t3 = times[3], t4 = times[4])
-  pars_model = list(r0 = 1, k1 = 1, k2 = 1, x1 = 1, x2 = 1, y1 = 1, y2 = 1) # these values actually don't matter
-  dyn.load(dynlib(filename))
-  
-  LL_2kxf = MakeADFun(data = data_model, parameters = pars_model, DLL = filename)
-  if (return_LL) LL_2kxf <<- LL_2kxf
-  
-  model_fit = nlminb(LL_2kxf$par, LL_2kxf$fn, LL_2kxf$gr, lower = c(0, 0, 0, -max_speed, -max_speed, -max_speed, -max_speed), 
-                     upper = c(max_speed, 1e2, 1e2, max_speed, max_speed, max_speed, max_speed), control = list(eval.max = 1000, iter.max = 1000))
-  
-  ses = sdreport(LL_2kxf)$sd
-  
-  data.frame(model = "2kxf", t1 = times[1], t2 = times[2], t3 = times[3], t4 = times[4], parname = names(pars_model), NLL = model_fit$objective, AIC = 2*model_fit$objective + 2*length(model_fit$par), BIC = 2*model_fit$objective + log(nrow(data_in))*length(model_fit$par), estimate = model_fit$par, std_err = ses, CL = model_fit$par - 1.96*ses, CU = model_fit$par + 1.96*ses, convergence = model_fit$message)
-  
-}
-
 # Make a matrix of possible migration times based on a set of inputs
 #
 # starts = vector of start times
@@ -564,76 +317,6 @@ make_times_matrix = function(starts, ends = starts, starts2 = ends, ends2 = star
   
 }
 
-# Fits the multivariate Gaussian migration model using TMB (r(t) is a step function with fixed bounds)
-#
-# times_list: matrix or data.frame with 2 or 4 columns (one for start time, one for end time)
-# data_in: data.frame or matrix with fields [longitude/x, latitude/y, x(t-1), y(t-1), x(t-2), y(t-2), difftime/# of days from start]
-# mod_type: what type of model are we running (either "rk" for r0, r1, r2, k0, k1, k2 or "rk1p" for r0, r1, k0, k1 with 2 migrations)
-# ...: additional arguments to fitting function
-#
-# Returns a model fit 
-estimate_times = function(times_list, data_in, mod_type = "rk", ...) {
-  
-  if (length(mod_type) > 1) mod_type = mod_type[1]
-  if (!((mod_type == "rk") | (mod_type == "rk1p") | (mod_type == "kv") | (mod_type == "kx"))) stop("invalid 'mod_type' value")
-  
-  # Remove items from times_list that are greater than max(data_in[,7]) (i.e., one of the times is too large)
-  times_list = times_list[times_list[, ncol(times_list)] <= max(data_in[, 7]), ]
-  
-  result = data.frame()
-  
-  for (i in 1:nrow(times_list)) {
-    if (ncol(times_list) == 2) {
-      fit = tryCatch(fit_1stepmigration_rkf_TMB(data_in, as.numeric(times_list[i, ]), ...),
-                     error = function(e) {
-                       data.frame(NLL = Inf, estimate = rep(NA, 4), convergence = as.character(e))
-                     })
-      
-      result = rbind(result, cbind(t1 = times_list[i, 1], t2 = times_list[i, 2], NLL = fit$NLL[1], r0 = fit$estimate[1], 
-                                   r1 = fit$estimate[2], k0 = fit$estimate[3], k1 = fit$estimate[4], msg = fit$convergence[1]))
-    } else if (mod_type == "rk1p" | mod_type == "r1k1") {
-      fit = tryCatch(fit_2stepmigration_rkf1p_TMB(data_in, as.numeric(times_list[i, ]), ...),
-                     error = function(e) {
-                       data.frame(NLL = Inf, estimate = rep(NA, 4), convergence = as.character(e))
-                     })
-      
-      result = rbind(result, cbind(t1 = times_list[i, 1], t2 = times_list[i, 2], t3 = times_list[i, 3], t4 = times_list[i, 4], 
-                                   NLL = fit$NLL[1], r0 = fit$estimate[1], r1 = fit$estimate[2], k0 = fit$estimate[3], 
-                                   k1 = fit$estimate[4], msg = fit$convergence[1]))
-    } else if (mod_type == "kv") {
-      fit = tryCatch(fit_2stepmigration_kvf_TMB(data_in, as.numeric(times_list[i, ]), ...),
-                     error = function(e) {
-                       data.frame(NLL = Inf, estimate = rep(NA, 5), convergence = as.character(e))
-                     })
-      
-      result = rbind(result, cbind(t1 = times_list[i, 1], t2 = times_list[i, 2], t3 = times_list[i, 3], t4 = times_list[i, 4], 
-                                   NLL = fit$NLL[1], r1 = fit$estimate[1], k1 = fit$estimate[2], v1 = fit$estimate[3], 
-                                   v2 = fit$estimate[4], msg = fit$convergence[1]))
-    } else if (mod_type == "kx") {
-      fit = tryCatch(fit_2stepmigration_kxf_TMB(data_in, as.numeric(times_list[i, ]), ...),
-                     error = function(e) {
-                       data.frame(NLL = Inf, estimate = rep(NA, 5), convergence = as.character(e))
-                     })
-      
-      result = rbind(result, cbind(t1 = times_list[i, 1], t2 = times_list[i, 2], t3 = times_list[i, 3], t4 = times_list[i, 4], 
-                                   NLL = fit$NLL[1], r0 = fit$estimate[1], k1 = fit$estimate[2], k2 = fit$estimate[3], x1 = fit$estimate[4], 
-                                   x2 = fit$estimate[5], y1 = fit$estimate[6], y2 = fit$estimate[7], msg = fit$convergence[1]))
-    } else { # if (ncol(times_list) == 4 && mod_type == "rk") {
-      fit = tryCatch(fit_2stepmigration_rkf_TMB(data_in, as.numeric(times_list[i, ]), ...),
-                     error = function(e) {
-                       data.frame(NLL = Inf, estimate = rep(NA, 6), convergence = as.character(e))
-                     })
-      
-      result = rbind(result, cbind(t1 = times_list[i, 1], t2 = times_list[i, 2], t3 = times_list[i, 3], t4 = times_list[i, 4], 
-                                   NLL = fit$NLL[1], r0 = fit$estimate[1], r1 = fit$estimate[2], r2 = fit$estimate[3],
-                                   k0 = fit$estimate[4], k1 = fit$estimate[5], k2 = fit$estimate[6], msg = fit$convergence[1]))
-    }
-  }
-  
-  result
-  
-}
-
 # Run the estimate_times function twice with a coarse (times1) and fine (times2) temporal resolution to more efficiently identify the optimum
 #
 # times1: matrix or data.frame with 2 or 4 columns (one for start time, one for end time)
@@ -650,9 +333,11 @@ estimate_times = function(times_list, data_in, mod_type = "rk", ...) {
 # Returns a data frame similar to estimate_times
 estimate_times_nlevels = function(times1, intervals = NULL, data_in = NULL, mod_type = "r1k1", NLL_tol = 0, NLL_include = 1, buffers = c(1, 1, 1, 1), bounds = c(-Inf, Inf), min_diff = 0, cpp = FALSE, ...) {
   
-  efunc = estimate_times
+  # efunc = estimate_times
   if (cpp) {
     efunc = estimate_times_cpp
+  } else {
+    efunc = estimate_times
   }
   
   if (is.null(data_in)) stop("need data")
@@ -663,7 +348,7 @@ estimate_times_nlevels = function(times1, intervals = NULL, data_in = NULL, mod_
   
   estimates = efunc(times1, data_in, mod_type = mod_type, ...)
   if (NLL_include > nrow(estimates)) NLL_include = nrow(estimates) # so we don't have more rows than we need!
-    
+  
   if (any(order(intervals) != (length(intervals):1))) stop("intervals not ordered properly")
   
   seq_fun = function(x, ind_1 = 2, ind_2 = 1) {
@@ -702,23 +387,6 @@ estimate_times_nlevels = function(times1, intervals = NULL, data_in = NULL, mod_
   
 }
 
-# Generate a heatmap of a likelihood function for two parameters
-#
-# likelihoods: data.frame, returned by estimate_times, of optimization for each value of the parameters
-# parnames: vector of strings, only first two elements considered, containing column names for parameters
-# objectivename: name of column from likelihoods that contains objective (likelihood or log-likelihood) values
-#
-# Returns a matrix where the rows and columns represent values of the variables included in parnames, and the matrix values are the values of objectivenames
-LL_profile_matrix = function(likelihoods, parnames = c("t1", 't2'), objectivename = "NLL") {
-  rows = as.matrix(unique(likelihoods[, parnames[1]]))
-  cols = as.matrix(unique(likelihoods[, parnames[2]]))
-  
-  t(apply(rows, 1, function(x) {apply(cols, 1, function(y) {
-    if (y <= x) return(NA)
-    likelihoods[likelihoods[, parnames[1]] == x & likelihoods[, parnames[2]] == y, objectivename]
-  })}))
-}
-
 # Calculate net squared displacement (NSD) from data
 #
 # data_in: data.frame or matrix with fields [longitude/x, latitude/y]. Note that full steps and time indices are not needed here!
@@ -736,13 +404,21 @@ net_squared_displacement = function(data_in) {
 # units: what units are the data in? Right now code handles "m" (meters) and "km" (kilmeters). The only reason this matters is because if units == "m" the NSD values become ridiculously large and it's problematic. But, if units == "km" we don't want to divide unnecessarily.
 # Output: 
 fit_NSD_migration = function(data_in, 
-                             units = "m") {
+                             units = "m",
+                             phi_guesses = c(20, 10, 5, 1, 0.5)) {
   # Note we use 1000^2 here because NSD is a squared unit
   factor_div = ifelse(units == "m", 1000^2, 1)
   NSD = net_squared_displacement(data_in) / factor_div
   t = data_in[, 3]
   
-  model_nsd = nls(NSD ~ delta / (1 + exp((theta - t)/phi)), start = list(delta = median(NSD), theta = median(t), phi = 10), trace = 0, lower = list(delta = 0, theta = min(t), phi = 1), upper = list(delta = max(NSD), theta = max(t), phi = max(t)-min(t)), algorithm = "port")
+  ind = 1
+  model_nsd = "error"
+  while(is.character(model_nsd) & ind <= length(phi_guesses)) {
+    this_phi = phi_guesses[ind]
+    model_nsd = tryCatch(nls(NSD ~ delta / (1 + exp((theta - t)/phi)), start = list(delta = median(NSD), theta = median(t), phi = this_phi), trace = 0, lower = list(delta = 0, theta = min(t), phi = 1), upper = list(delta = max(NSD), theta = max(t), phi = max(t)-min(t)), algorithm = "port", control = list(maxiter = 10000)), error = function(e) "error")
+    ind = ind + 1
+  }
+  if (is.character(model_nsd)) stop("Unable to fit nonlinear least squares. Try changing initial conditions for model parameters using phi_guesses argument.")
   
   # Get model parameters and convert them into t1, t2, and intensity. For now, leave out CI's because I don't think you can extrapolate CI's for t1 and t2 in the way that I'm imagining, because the parameters are not independent.
   pars_orig = coef(model_nsd)
@@ -838,11 +514,13 @@ fit_fpt_penalized_contrast = function(data_in,
 #
 # data_in: data.frame or matrix with fields [longitude/x, latitude/y, difftime/# of days from start]. Note that full steps are not needed here!
 # metric: typically "V * cos(Theta)" (persistence velocity). See WindowSweep for more information.
+# true_indices: either NULL or a numeric vector of length 2. If it's a vector we give the model the benefit of the doubt and have it return the closest indices to the true values; otherwise we just return the first two
 # ...: additional arguments to WindowSweep
 #
 # Returns: vector with t1 and t2
 fit_bcpa = function(data_in, 
                     metric = "V * cos(Theta)",
+                    true_indices = NULL,
                     ...) {
   
   require(bcpa)
@@ -856,7 +534,7 @@ fit_bcpa = function(data_in,
   # pick the two changepoints with the most selected windows and get the corresponding times
   best_changepoint_indices = order(changepoint_sizes, decreasing = TRUE)[1:2]
   # Get the time points corresponding to the strongest changepoints
-  best_times = changepoints_bcpa$breaks$middle.POSIX[best_changepoint_indices]
+  best_times = changepoints_bcpa$breaks$middle.POSIX[best_changepoint_indices] %>% sort
   c(t1 = best_times[1], t2 = best_times[2])
 }
 
@@ -909,19 +587,49 @@ fit_NSD_piecewise = function(data_in, units = "m", c_mig = 1) {
 # Fit the model from Gurarie et al. (2017)
 #
 # data_in: data.frame or matrix with fields [longitude/x, latitude/y, x(t-1), y(t-1), x(t-2), y(t-2), difftime/# of days from start, Code]. Can include non-code 2's although anything 0 or lower will be removed.
+# ...: additional arguments to estimate_shift
 #
 # Returns estimates for the beginning and end of migration
-fit_marcher = function(data_in) {
+fit_marcher = function(data_in, ...) {
   
   require(marcher)
   
-  fit = estimate_shift(T = data_in[,7], X = data_in[,1], Y = data_in[,2])
+  fit = estimate_shift(T = data_in[,7], X = data_in[,1], Y = data_in[,2], ...)
   
   t1 = fit$p.hat["t1"]
   t2 = t1 + fit$p.hat["dt"]
   
   c(t1 = t1, t2 = t2)
   
+}
+
+# Fit the Bayesian partitioning of Markov models change point analysis
+#
+# data_in: data.frame or matrix with fields [longitude/x, latitude/y, difftime/# of days from start]. Note that full steps are not needed here!
+#
+# Returns: vector with t1 and t2
+fit_bpmm = function(data_in) {
+  data_traj = as.ltraj(xy = data_in[,1:2], date = as.POSIXct("2000-01-01") + data_in[,3] * 60 * 60 * 24, id = "data")
+  
+  data_segments = Prep.segments(data_traj, units = "day", dt = 1, sd = 2, nmodels = 20, plotit = FALSE)
+  # Have to do the Partition.segments() manually because there's an error I need to fix
+  Data.traj <- data_segments$Data.traj
+  models <- data_segments$models
+  mus <- data_segments$mus
+  
+  # partition the parameters
+  
+  pm <- partmod.ltraj(Data.traj, 3, models, na.manage = "locf")
+  
+  Model.bpm <- as.numeric(substr(pm[2]$stats$which.mod,5,10))
+  if(data_segments$log) Mus.bpm <- round(exp(mus[Model.bpm]),2) else Mus.bpm <- mus[Model.bpm]
+  Phases.bpm <- data.frame(Model = Model.bpm, Mu = Mus.bpm, summary(pm$ltraj))
+  data_partitions = list(pm = pm, Phases.bpm = Phases.bpm, Segment.prep = data_segments)
+  
+  t_migration = data_partitions$Phases.bpm$date.end[1:2] # get end of first and second phases
+  t_migration_num = as.numeric(difftime(t_migration, as.POSIXct("2000-01-01"), units = "days"))
+  names(t_migration_num) = c("t1", "t2")
+  t_migration_num
 }
 
 # Given a dataset with a known optimum, calculate bootstrapped confidence intervals
@@ -967,52 +675,6 @@ sim_sl_ta = function(data_in, pars) {
   simmed_data[,2] = r_y
   
   simmed_data
-  
-}
-
-# Simulate migratory movement using the marcher package and return it using the same framework as the rest of the code here
-#
-# n_steps: integer > 0; how many timesteps to simulate for
-# mu: named numeric vector; contains movement paramters, see ?simulate_shift for more
-# A: numeric > 0; 95% home range area parameter (dictates how much the animal moves when it isn't migrating)
-# tau: named numeric vector; autocorrelation parameters, NULL if no autocorrelation
-# percent_removed: numeric in [0, 1]; how much data do we (artificially) remove at the end to simulate imperfect fixes?
-# error: numeric > 0; how much do we artificially jitter the results to produce GPS error?
-#
-# Returns a data.frame similar to what would be returned by sim_migratory_movement
-sim_migratory_marcher = function(n_steps, mu, A, tau = NULL, percent_removed = 0, error = 0) {
-  
-  require(marcher)
-  
-  raw_shift = simulate_shift(1:n_steps, tau = tau, mu = mu, A = A)
-  raw_shift$t = raw_shift$T
-  # add error (simple uncorrelated and isotropic for now)
-  raw_shift$x = raw_shift$X + rnorm(nrow(raw_shift), 0, error)
-  raw_shift$y = raw_shift$X + rnorm(nrow(raw_shift), 0, error)
-  # add previous values
-  raw_shift = raw_shift %>% mutate(x1 = dplyr::lag(x), y1 = dplyr::lag(y)) %>% 
-    mutate(x2 = dplyr::lag(x1), y2 = dplyr::lag(y1))
-  # artificially and randomly remove values
-  raw_shift = raw_shift %>% mutate(kept0 = as.logical(rbinom(nrow(raw_shift), 1, 1 - percent_removed))) %>%
-    mutate(kept1 = dplyr::lag(kept0, default = FALSE)) %>% mutate(kept2 = dplyr::lag(kept1, default = FALSE))
-  
-  # REMINDER: Guide for codes
-  # -2: "missing" point that is included in data frame temporarily
-  # -1: "available" point simulated for use-available modelling
-  # 0: endpoint of a step with no begin point
-  # 1: endpoint of a step with only one previous consecutive point
-  # 2: endpoint of a "full" step with two consecutive previous points
-  # 3: first point of the dataset
-  # 4: endpoint of step beginning at the fisrt point of the dataset
-  
-  raw_shift = raw_shift %>% mutate(Code = ifelse(is.na(x1) & is.na(x2), 3, 
-                                                 ifelse(is.na(x2), 4, 
-                                                        ifelse(kept0 & kept1 & kept2, 2,
-                                                               ifelse(kept0 & kept1, 1,
-                                                                      ifelse(kept0, 0,
-                                                                             -2))))))
-  
-  result = raw_shift %>% dplyr::filter(kept0) %>% dplyr::select(x, y, x1, y1, x2, y2, t, Code)
   
 }
 

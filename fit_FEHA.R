@@ -4,13 +4,13 @@ require(tidyverse)
 sourceCpp("cpp_functions.cpp")
 debugSource("fitting_functions.R")
 
-BUFFER = 7
+BUFFER = 7 # minimum # of days for a migration to take place
 N_MIGRATIONS = 1 # Feel free to change this to 2 and see what happens
 
 data_in = read_csv("sample_FEHA.csv")[, -1]
 data_for_migration = as.matrix(data_in[, c("easting", "northing", "xprev", "yprev", "xprevprev", "yprevprev", "dt")])
 
-# This is for n_levels
+# This is for estimate_times_nlevels
 times_matrix = make_times_matrix(c(seq(min(data_for_migration[, 7]), max(data_for_migration[, 7]), by = 14), max(data_for_migration[,7])), n_migrations = N_MIGRATIONS, min_diff = BUFFER)
 
 # Model fitting the new way (with n levels)
