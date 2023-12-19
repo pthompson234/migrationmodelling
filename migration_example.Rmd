@@ -1,0 +1,116 @@
+---
+title: "Simultaneous estimation of the temporal and spatial extent of animal migration using step lengths and turning angles: Example workflow"
+author: "Peter R. Thompson, Peter D. Harrington, Conor D. Mallory, Subhash R. Lele, Erin M. Bayne, Andrew E. Derocher, Mark A. Edwards, Mitch Campbell, Mark A. Lewis"
+date: "2023-12-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+Here we provide an example of the workflow required 
+
+To access the code required to fit the models to data, we must first load in all necessary functions. Some functions are written in C++ for computational efficiency and can be read into R as traditional functions using `Rcpp::sourceCpp()`.
+
+```{r source, message = FALSE}
+require(Rcpp) # necessary for running C++ functions
+
+sourceCpp("cpp_functions.cpp")
+source("fitting_functions.R")
+```
+
+## Processing data
+
+To begin we must, of course, read in our data.
+
+```{r read, message = FALSE}
+require(tidyverse)
+
+data_in = read_csv("sample_FEHA.csv", show_col_types = FALSE)[, -1] # can also use read.csv()
+data_for_migration = as.matrix(data_in[, c(2:7, 1)]) # reorder data so it matches the proper format, see below
+```
+
+``` {r}
+head(data_for_migration)
+```
+
+Movement data come in many pre-packaged forms. Our functions take movement data as matrices with 7 columns: the animal's x and y coordinates at the current timestep, x and y coordinates at the previous timestep, x and y coordinates at the timestep before that, and the time of each observation. The data we provide in our GitHub repository have already been processed to fit this format. For data that are not pre-processed, the chunk of code below can be applied (with modifications as necessary):
+
+```{r example-data-manip, eval = FALSE}
+data_in = data_in %>% mutate(xprev = dplyr::lag(easting), yprev = dplyr::lag(northing),
+                             # dplyr::lag() takes the previous value from each column
+                             xprevprev = dplyr::lag(xprev), yprevprev = dplyr::lag(yprev),
+                             diff_time = dt - dplyr::lag(dt)) %>% # Get the time difference for each step
+  dplyr::filter(diff_time == 1) %>% 
+  # only keep entries for which the timestep length is appropriate (removes steps that are too long) - may need to institute a "buffer" of allowable time step differences in case diff_time is not always exactly equal to 1
+  dplyr::select(easting, northing, xprev, yprev, xprevprev, yprevprev, dt) %>% # keep only the columns we are interested in
+  as.matrix # convert to matrix so C++ functions can work properly
+```
+
+## Fitting the model
+
+We are now ready to fit the model to the data, which can be accomplished in a few lines using the functions we have already read in. First, let's define a few constants that will determine how the models run. Feel free to change these as you see fit for your data.
+
+```{r constants}
+N_MIGRATIONS = 1 # Let's start by fitting a model that estimates one migration (two changepoints). To avoid intense computational expense, we recommend keeping this equal to 1 or 2.
+MIN_MIGRATION_LENGTH = 7 # the minimum allowable length of a migration, which will depend on the species for which data are being fit. Units here will correspond to whatever units are used for the first column of the movement data matrix; here, our unit is days.
+```
+
+These functions calculate the likelihood function for our model at a pre-determined grid of candidate change-point values. We first need to provide these candidate values using the `make_times_matrix` function. You can give this function one sequence of change-points, as we do here, and it will automatically generate all possible sets of change-points for the appropriate number of migrations (filtering out values where the changepoints are equal or in the wrong order, for example).
+
+```{r times_matrix}
+all_time_values = data_for_migration[, 7]
+# Generate candidate change-points based on the times in which the animal was tagged. Use an initial interval of 14 days. Include the maximum value at the end because it will likely be omitted by the `seq()` function. 
+candidate_change_points = c(seq(min(all_time_values), max(all_time_values), by = 14), max(all_time_values))
+times_matrix = make_times_matrix(starts = candidate_change_points, 
+                                 n_migrations = N_MIGRATIONS, 
+                                 min_diff = MIN_MIGRATION_LENGTH)
+head(times_matrix)
+```
+
+Just like that, we are ready to fit the model! The main engine through which users will fit the model to data is the `estimate_times_nlevels` function. This function initiates the multi-level grid-search algorithm discussed in our manuscript. The initial `times_matrix` supplied to this function will be thoroughly searched before being subsetted and rarefied to search high-likelihood regions more finely. The output of `estimate_times_nlevels` is the maximum likelihood values for every time point we checked. The maximum likelihood estimate for the model parameters can easily be obtained by subsetting the row of this object with the lowest negative log likelihood value.
+
+```{r model-fit}
+model_fit = estimate_times_nlevels(times1 = times_matrix, # Our times_matrix
+                                   intervals = c(14, 7, 3, 1),
+                                   # The set of candidate intervals we want to try.
+                                   data_in = data_for_migration, # Our input data
+                                   NLL_include = 5, 
+                                   # At each step, retain the grid points with the 5 best likelihood values, in base the best value in the first grid does not correspond to the global optimum, for example
+                                   bounds = range(all_time_values), 
+                                   # This ensures that subsequent times_matrices do not generate candidate changepoints outside of the interval in which data were collected.
+                                   min_diff = MIN_MIGRATION_LENGTH,
+                                   # Even though our initial times_matrix already satisfies our desired minimum migration length, subsequent ones will not be unless we specify that length again here.
+                                   cpp = TRUE) # This ensures we run the C++ version of the files, speeding up computation
+
+n_timestep_indices = ncol(times_matrix) # how many t_i parameters are we estimating? useful for subsetting below
+
+# Get the best likelihood value. The estimate_times_nlevels function returns a data.frame with the t_i parameters, then the negative log-likelihood, then the other (step length and turning angle) parameters.
+this_migration = model_fit[which.min(model_fit[,1+n_timestep_indices]), , drop = FALSE]
+best_pars = as.numeric(this_migration[, -(1 + n_timestep_indices)]) # these are the indices of our parameters (can check with the all_fits file)
+names(best_pars) = c(paste0("t", 1:n_timestep_indices), "r0", "r1", "k0", "k1")
+
+message("Model fit: ")
+head(model_fit[order(model_fit[, 1+n_timestep_indices], decreasing = TRUE), ])
+message("Parameter estimates: ")
+print(best_pars)
+```
+
+The last step in this document is to generate confidence intervals for our parameter estimates using the parametric bootstrapping method discussed in the manuscript. We provide a simple function, `bootstrap_CI`, which does this.
+
+```{r CI, message = FALSE, warning = FALSE}
+CIs = bootstrap_CI(data_in = data_for_migration, # input data
+                   optim_pars = best_pars,
+                   # parameters fit by the model. The bootstrapping algorithm simulates migratory paths from these parameters and fits the model to them to get a distribution of potential parameter estimates.
+                   n_iter = 100, # number of simulations to run
+                   progress = FALSE, # to limit text output; can be useful to set this TRUE though
+                   times_matrix = times_matrix, intervals = c(14, 7, 3, 1), NLL_include = 5, cpp = TRUE)
+                   # These are all just additional arguments to `estimate_times_nlevels` which is called inside of this function
+```
+
+```{r}
+round(CIs, 4)
+```
